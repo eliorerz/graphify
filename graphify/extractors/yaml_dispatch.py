@@ -1,25 +1,42 @@
 """Combined YAML dispatcher -- the actual `.yaml`/`.yml` entry point.
 
-OSAC-4050. Layered per document (a single file can bundle multiple
-`---`-separated documents, confirmed against a real file in this repo --
-see graphify/extractors/_yaml_cst.py's ``all_documents`` docstring):
+OSAC-4050. Two phases (a single file can bundle multiple `---`-separated
+documents, confirmed against a real file in this repo -- see
+graphify/extractors/_yaml_cst.py's ``all_documents`` docstring):
 
-1. If a document parses cleanly and looks like a real k8s resource
-   (``is_k8s_manifest_shape``), extract its rich ownership/reference/
-   selector relationships (``graphify.extractors.k8s_manifest``).
-2. Otherwise, if it parses cleanly, fall back to a generic structural walk
+1. Classify every document in the file: unparseable-for-our-purposes
+   (skip + warn), k8s-manifest-shaped, or generic.
+2. Extract ALL k8s-shaped documents in ONE call to
+   ``extract_k8s_resources`` (not one call per document -- a real,
+   reviewer-caught bug in an earlier version of this file: calling it
+   per-document defeats the two-pass same-file design
+   ``graphify.extractors.k8s_manifest`` itself relies on for resolving a
+   same-file forward/cross-document reference, e.g. a Deployment owned by
+   a Namespace declared earlier in the same multi-document file -- each
+   document got its own empty ``local_nids`` scope, so the real Namespace
+   definition was never visible when resolving the Deployment's owner
+   reference, minting a duplicate stub instead of linking to it). Every
+   other (non-k8s-shaped) document falls back to a generic structural walk
    with no domain semantics (``graphify.extractors.yaml_generic``) --
    universal coverage, per the user's explicit, confirmed direction change
    partway through this ticket's implementation: even YAML with no
    recognized schema should get SOME representation in the graph, rather
    than staying invisible the way pre-OSAC-4050 graphify left ALL YAML.
-3. If a document doesn't parse cleanly at all (`node.has_error` -- e.g. a
-   Helm chart's Go-templated `{{ include ... }}` syntax, confirmed
-   empirically during this ticket's investigation to break the
-   tree-sitter-yaml grammar outright, producing an ERROR node rather than a
-   best-effort partial tree), it is skipped with a one-line warning naming
-   the file -- never crashed on, never walked for "structure" that would
-   really just be gibberish extracted from a broken parse.
+
+A document is treated as unparseable-for-our-purposes if EITHER
+`node.has_error` is set OR its raw text contains a `{{` marker. Both
+checks are necessary -- confirmed empirically (another reviewer-caught
+gap) that neither alone is reliable for real Helm template syntax:
+`replicas: {{ .Values.replicaCount }}` (the single most common Helm
+templating idiom) parses with `has_error=False` on the specific document
+node this dispatcher checks even though it's obviously not real YAML content
+(`{{` opens what tree-sitter-yaml treats as valid, if bogus, nested flow-
+mapping syntax) -- silently extracted as "clean" without the `{{` check.
+Conversely, `image: {{ .Values.x }}:{{ .Values.y }}` (concatenated
+template blocks) sets `has_error=True` on the STREAM root but NOT on the
+specific per-document node checked -- silently produces zero output
+without the `has_error` check, since the per-document check alone missed
+an error that exists elsewhere in the same parse tree.
 """
 from __future__ import annotations
 
@@ -32,6 +49,16 @@ from graphify.extractors.k8s_manifest import extract_k8s_resources, is_k8s_manif
 from graphify.extractors.yaml_generic import extract_generic_structure
 
 _YAML_MAX_BYTES = 1_048_576  # 1 MiB -- matches every other extractor's cap in this fork
+
+# Go/Helm template marker. See module docstring: has_error alone (checked
+# per-document) misses real cases in both directions, so any document whose
+# raw text contains this is treated as unparseable-for-our-purposes
+# regardless of what has_error says.
+_TEMPLATE_MARKER = b"{{"
+
+
+def _is_unparseable(doc) -> bool:
+    return doc.has_error or _TEMPLATE_MARKER in doc.text
 
 
 def extract_yaml(path: Path) -> dict:
@@ -72,20 +99,30 @@ def extract_yaml(path: Path) -> dict:
                               "source_file": str_path, "source_location": None})
             file_node_added = True
 
+    # Phase 1: classify every document before extracting anything, so all
+    # k8s-shaped documents in this file can be extracted together in ONE
+    # call (see module docstring for why per-document calls are a bug, not
+    # just a style choice).
+    k8s_shaped_tops: list = []
+    generic_docs: list[tuple[int, object]] = []
     for doc_index, doc in enumerate(all_documents(root)):
-        if doc.has_error:
+        if _is_unparseable(doc):
             skipped_docs += 1
             continue
         m = _mapping(doc)
         if m is not None and is_k8s_manifest_shape(m):
-            _ensure_file_node()
-            k8s_nodes, k8s_edges = extract_k8s_resources([m], str_path, file_nid)
-            all_nodes.extend(k8s_nodes)
-            all_edges.extend(k8s_edges)
-            continue
-        # Not k8s-shaped (or not even a mapping at the top level) but parses
-        # cleanly -- generic structural fallback. Walk from the raw doc
-        # value (not `m`, which is None for a non-mapping document).
+            k8s_shaped_tops.append(m)
+        else:
+            generic_docs.append((doc_index, doc))
+
+    # Phase 2: extract.
+    if k8s_shaped_tops:
+        _ensure_file_node()
+        k8s_nodes, k8s_edges = extract_k8s_resources(k8s_shaped_tops, str_path, file_nid)
+        all_nodes.extend(k8s_nodes)
+        all_edges.extend(k8s_edges)
+
+    for doc_index, doc in generic_docs:
         generic_nodes, generic_edges, truncated = extract_generic_structure(doc, str_path, file_nid, doc_index)
         if generic_nodes:
             _ensure_file_node()
@@ -103,9 +140,9 @@ def extract_yaml(path: Path) -> dict:
         # a silent skip.
         suffix = "s" if skipped_docs > 1 else ""
         print(
-            f"  warning: {path.name}: {skipped_docs} document{suffix} did not "
-            f"parse as valid YAML (commonly Go/Helm template syntax breaking "
-            f"the grammar) -- skipped, not extracted.",
+            f"  warning: {path.name}: {skipped_docs} document{suffix} not "
+            f"treated as real YAML (parse error, or Go/Helm template syntax "
+            f"detected) -- skipped, not extracted.",
             file=sys.stderr,
         )
     if truncated_docs:

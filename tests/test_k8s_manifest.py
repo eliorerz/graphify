@@ -287,6 +287,69 @@ def test_no_dangling_edge_endpoints(tmp_path):
         assert e["target"] in node_ids
 
 
+def test_cluster_scoped_owner_resolves_to_one_real_node_not_a_duplicate_stub(tmp_path):
+    """Regression test for a real reviewer-caught bug: a namespaced child
+    (Deployment, namespace "osac") owned by a cluster-scoped resource
+    (Namespace "osac" itself, which has no metadata.namespace of its own)
+    previously had its owner lookup keyed by the CHILD's namespace, missing
+    the real Namespace node (indexed with an empty namespace) and minting a
+    duplicate stub instead.
+
+    Deliberately asserts on real node ID uniqueness/identity, not just
+    label pairs via _rel_pairs/_labels -- those helpers are blind to two
+    distinct node dicts that happen to share the same label, which is
+    exactly the shape this bug produced.
+    """
+    body = (
+        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: osac\n"
+        "---\n"
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: osac-controller-manager\n"
+        "  namespace: osac\n  ownerReferences:\n    - apiVersion: v1\n      kind: Namespace\n      name: osac\n"
+    )
+    r = extract_yaml(_write(tmp_path, "manager.yaml", body))
+
+    namespace_nodes = [n for n in r["nodes"] if n["label"] == "Namespace/osac"]
+    assert len(namespace_nodes) == 1, f"expected exactly one Namespace/osac node, got {namespace_nodes}"
+    real_namespace_id = namespace_nodes[0]["id"]
+    # The real definition has a source_file/source_location; a stub does not.
+    assert namespace_nodes[0]["source_file"], "the surviving node must be the real definition, not a sourceless stub"
+
+    owns_edges = [e for e in r["edges"] if e["relation"] == "owns"]
+    assert len(owns_edges) == 1
+    assert owns_edges[0]["source"] == real_namespace_id, (
+        f"owns edge must bind to the real Namespace node ({real_namespace_id}), "
+        f"not a duplicate stub (got {owns_edges[0]['source']!r})"
+    )
+
+
+def test_cluster_scoped_owner_across_separate_files_still_resolves(tmp_path):
+    """Same scenario as above, but the Namespace and Deployment are two
+    separate files fed through extract() together -- confirms the fix
+    holds for genuine cross-file resolution too, not just same-file
+    same-batch resolution."""
+    ns = _write(tmp_path, "namespace.yaml", "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: osac\n")
+    dep = _write(tmp_path, "deployment.yaml", (
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: osac-controller-manager\n"
+        "  namespace: osac\n  ownerReferences:\n    - apiVersion: v1\n      kind: Namespace\n      name: osac\n"
+    ))
+    r = extract([ns.resolve(), dep.resolve()], root=tmp_path)
+    # Two independent per-file extractions can each mint their own raw dict
+    # for the same id (one real, one stub) -- true collapsing across files
+    # happens when the graph itself is built (same precedent as
+    # test_shared_action_merges_across_workflows in test_github_actions.py),
+    # so assert on the unique ID set and the built graph, not the raw list.
+    namespace_ids = {n["id"] for n in r["nodes"] if n["label"] == "Namespace/osac"}
+    assert len(namespace_ids) == 1, f"expected one shared Namespace/osac id, got {namespace_ids}"
+    namespace_id = namespace_ids.pop()
+
+    G = build_from_json({"nodes": r["nodes"], "edges": r["edges"]})
+    assert G.has_node(namespace_id)
+
+    owns_edges = [e for e in r["edges"] if e["relation"] == "owns"]
+    assert len(owns_edges) == 1
+    assert owns_edges[0]["source"] == namespace_id
+
+
 # ── combined dispatcher: layering + templated-YAML safety ──────────────────
 
 def test_dispatcher_routes_k8s_shaped_yaml_to_rich_extraction(tmp_path):
@@ -320,7 +383,7 @@ def test_dispatcher_skips_templated_yaml_without_crashing(tmp_path, capsys):
     assert r == {"nodes": [], "edges": []}
     captured = capsys.readouterr()
     assert "metrics-service.yaml" in captured.err
-    assert "did not parse" in captured.err
+    assert "not treated as real YAML" in captured.err
 
 
 def test_dispatcher_handles_mixed_multi_doc_file(tmp_path):
@@ -335,6 +398,36 @@ def test_dispatcher_handles_mixed_multi_doc_file(tmp_path):
     labels = set(_labels(r))
     assert "ConfigMap/cm" in labels
     assert "plainKey" in labels
+
+
+def test_dispatcher_skips_bare_inline_template_value(tmp_path, capsys):
+    """Regression test for a real reviewer-caught gap: `replicas: {{ .Values.x }}`
+    (arguably the single most common Helm templating idiom -- more common
+    than the `{{ include ... }}` pattern in test_dispatcher_skips_templated_yaml_without_crashing)
+    parses with has_error=False on the specific document node the dispatcher
+    checks (confirmed empirically) -- `{{` looks like valid, if bogus,
+    nested flow-mapping syntax to the YAML grammar, not a parse error. Only
+    the additional raw-text `{{` marker check catches this; has_error alone
+    does not."""
+    body = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\nspec:\n  replicas: {{ .Values.replicaCount }}\n"
+    p = _write(tmp_path, "deployment.yaml", body)
+    r = extract_yaml(p)
+    assert r == {"nodes": [], "edges": []}
+    assert "not treated as real YAML" in capsys.readouterr().err
+
+
+def test_dispatcher_skips_concatenated_template_blocks(tmp_path, capsys):
+    """Regression test for the opposite direction of the same reviewer-caught
+    gap: `image: {{ .Values.x }}:{{ .Values.y }}` sets has_error=True on the
+    STREAM root but NOT on the specific per-document node the dispatcher
+    checks (confirmed empirically) -- has_error alone misses an error that
+    exists elsewhere in the same parse tree. Only the additional raw-text
+    `{{` marker check catches this."""
+    body = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: x\nspec:\n  containers:\n    - image: {{ .Values.x }}:{{ .Values.y }}\n"
+    p = _write(tmp_path, "pod.yaml", body)
+    r = extract_yaml(p)
+    assert r == {"nodes": [], "edges": []}
+    assert "not treated as real YAML" in capsys.readouterr().err
 
 
 # ── classify_file(): universal YAML/JSON coverage ───────────────────────────

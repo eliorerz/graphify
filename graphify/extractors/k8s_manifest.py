@@ -168,6 +168,47 @@ def _resource_id(kind: str, namespace: str, name: str) -> str:
     return _make_id(kind, namespace, name)
 
 
+# Well-known built-in cluster-scoped kinds -- these never carry a namespace
+# regardless of what namespace the resource referencing them (as an owner)
+# happens to live in. Real bug this fixes: a namespaced child (e.g. a
+# Deployment in namespace "osac") owned by a cluster-scoped resource (e.g.
+# the Namespace "osac" itself) previously had its owner looked up keyed by
+# the CHILD's namespace ("osac"), while the owner was indexed with an empty
+# namespace (Namespace resources have no metadata.namespace of their own) --
+# a guaranteed miss, minting a duplicate stub instead of resolving to the
+# real node. Not exhaustive (a cluster-scoped CRD not in this list still
+# resolves correctly via the "" fallback in _resolve_owner below, as long
+# as it's genuinely indexed with no namespace -- this list only lets the
+# common built-ins resolve WITHOUT relying on that fallback ordering).
+_CLUSTER_SCOPED_KINDS = frozenset({
+    "Namespace", "Node", "PersistentVolume", "StorageClass",
+    "ClusterRole", "ClusterRoleBinding", "CustomResourceDefinition",
+    "APIService", "ValidatingWebhookConfiguration",
+    "MutatingWebhookConfiguration", "PriorityClass", "RuntimeClass",
+    "VolumeAttachment", "CSIDriver", "CSINode",
+})
+
+
+def _resolve_owner(ref_kind: str, ref_name: str, child_namespace: str,
+                    local_nids: dict, ref_stub) -> str:
+    """Resolve an ownerReference to the real local definition if one
+    exists in this batch, trying both the child's own namespace and
+    cluster scope (empty namespace) rather than assuming the owner always
+    shares the child's namespace -- a namespaced child's owner is USUALLY
+    in the same namespace (the only legal case for two namespaced
+    resources), but a cluster-scoped owner (Namespace, ClusterRole, a CRD
+    declared cluster-scoped, ...) never has one at all.
+    """
+    candidate_namespaces = ([""] if ref_kind in _CLUSTER_SCOPED_KINDS
+                             else [child_namespace, ""])
+    for ns in candidate_namespaces:
+        nid = local_nids.get((ref_kind, ns, ref_name))
+        if nid is not None:
+            return nid
+    guess_ns = "" if ref_kind in _CLUSTER_SCOPED_KINDS else child_namespace
+    return ref_stub(_resource_id(ref_kind, guess_ns, ref_name), f"{ref_kind}/{ref_name}")
+
+
 def _walk_configmap_secret_refs(node, owner_nid, namespace, add_edge, ref_stub):
     mapping = _mapping(node)
     if mapping is not None:
@@ -376,8 +417,7 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
                 ref_name = _scalar_text(ref_pairs.get("name"))
                 if not ref_kind or not ref_name:
                     continue
-                parent_nid = local_nids.get((ref_kind, namespace, ref_name)) or _ref_stub(
-                    _resource_id(ref_kind, namespace, ref_name), f"{ref_kind}/{ref_name}")
+                parent_nid = _resolve_owner(ref_kind, ref_name, namespace, local_nids, _ref_stub)
                 _add_edge(parent_nid, owner_nid, "owns", r["line"])
 
         # -- custom annotation-based owner-reference + tenant scoping --

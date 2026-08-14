@@ -5027,6 +5027,19 @@ def _get_extractor(path: Path) -> Any | None:
     # mis-parsed. `.mm` is unambiguously Objective-C++ and stays on extract_objc.
     if suffix == ".m" and not _is_objc_source(path):
         return None
+    # `.yaml`/`.yml`: extract_github_actions() only makes sense for a real
+    # GitHub Actions workflow. Gating here (not just in _DISPATCH) matters
+    # for callers that reach extract() directly (collect_files() collects
+    # every .yaml/.yml in a tree, not just workflow-shaped ones -- a stray
+    # docker-compose.yaml anywhere would otherwise dispatch to
+    # extract_github_actions, return empty, and get misreported as a failed/
+    # empty extraction rather than "no extractor for this file", #OSAC-4049
+    # review round 3). Content-shape checking mirrors classify_file()'s own
+    # gate (is_github_actions_workflow_path + looks_like_workflow_shape).
+    if suffix in (".yaml", ".yml"):
+        from graphify.extractors.github_actions import is_github_actions_workflow_path, looks_like_workflow_shape
+        if not (is_github_actions_workflow_path(path) and looks_like_workflow_shape(path)):
+            return None
     # Extensionless files: resolve by shebang, mirroring detect.classify_file.
     # Without this, detect labels e.g. `#!/usr/bin/env bash` CLIs as code but
     # extraction returns no extractor and the file silently contributes nothing.

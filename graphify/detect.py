@@ -512,16 +512,22 @@ def classify_file(path: Path) -> FileType | None:
     # structure (jobs, needs, uses) an AST pass can extract deterministically
     # -- same rationale as the manifest carve-out above, and same mechanism
     # (route to CODE by path before the generic DOC_EXTENSIONS bucket claims
-    # the .yml/.yaml extension). Path-only check, no file read: content is
-    # validated inside extract_github_actions() itself, which returns an
-    # empty result for anything at this path that isn't actually workflow-
-    # shaped rather than this function guessing from a peek (OSAC-4049).
-    # Every OTHER .yaml/.yml (Helm values, k8s manifests, OpenAPI specs)
-    # deliberately keeps falling through to DOCUMENT below -- reclassifying
-    # YAML generically would regress their existing, correct semantic-pass
-    # handling.
-    from graphify.extractors.github_actions import is_github_actions_workflow_path
-    if is_github_actions_workflow_path(path):
+    # the .yml/.yaml extension). Also requires a cheap content sniff
+    # (`looks_like_workflow_shape`, a bounded-prefix regex, no tree-sitter)
+    # -- path alone is not enough: a non-workflow file that merely sits at
+    # this path (a stray Docker Compose file, ...) would otherwise be routed
+    # to CODE, extracted as empty by extract_github_actions(), and never
+    # reach the semantic pass at all, permanently losing its content rather
+    # than just producing a warning (real bug caught in OSAC-4049's review;
+    # the original path-only design assumed the extractor's own empty-result
+    # fallback was equivalent to a DOCUMENT classification, but CODE files
+    # never reach the semantic pass regardless of what the extractor
+    # returns). Every OTHER .yaml/.yml (Helm values, k8s manifests, OpenAPI
+    # specs) deliberately keeps falling through to DOCUMENT below --
+    # reclassifying YAML generically would regress their existing, correct
+    # semantic-pass handling.
+    from graphify.extractors.github_actions import is_github_actions_workflow_path, looks_like_workflow_shape
+    if is_github_actions_workflow_path(path) and looks_like_workflow_shape(path):
         return FileType.CODE
     # Compound extensions must be checked before simple suffix lookup
     if path.name.lower().endswith(".blade.php"):

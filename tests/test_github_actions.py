@@ -213,37 +213,57 @@ def test_empty_and_comment_only_files_are_safe(tmp_path):
 
 
 # ── classify_file() carve-out: the actual --code-only fix ───────────────────
+#
+# classify_file() requires BOTH a workflow path AND workflow-shaped content
+# (a cheap regex sniff for a top-level `jobs:` key, see
+# github_actions.looks_like_workflow_shape) -- path alone used to be enough,
+# but that let a non-workflow file sitting at a workflow path get routed to
+# CODE, extracted as empty, and never reach the semantic pass at all (a real
+# content-loss bug, not just a missed-nodes one; caught in review). So these
+# tests write real files rather than asserting on paths that don't exist on
+# disk.
 
-def test_workflow_path_classified_as_code():
-    assert classify_file(Path(".github/workflows/ci.yml")) == FileType.CODE
-    assert classify_file(Path(".github/workflows/nightly-build.yaml")) == FileType.CODE
+def test_workflow_path_classified_as_code(tmp_path):
+    assert classify_file(_write(tmp_path, ".github/workflows/ci.yml", WORKFLOW)) == FileType.CODE
+    assert classify_file(_write(tmp_path, ".github/workflows/nightly-build.yaml", WORKFLOW)) == FileType.CODE
 
 
-def test_workflow_path_classified_as_code_absolute():
-    assert classify_file(Path("/repo/osac/.github/workflows/ci.yml")) == FileType.CODE
+def test_workflow_path_classified_as_code_absolute(tmp_path):
+    p = _write(tmp_path, ".github/workflows/ci.yml", WORKFLOW)
+    assert classify_file(p.resolve()) == FileType.CODE
 
 
-def test_nested_workflows_dir_is_not_reclassified():
+def test_non_workflow_yaml_at_workflow_path_is_not_reclassified(tmp_path):
+    # A file that merely sits in .github/workflows/ but isn't workflow-shaped
+    # (no `jobs:` key at all) must fall through to DOCUMENT, not CODE --
+    # otherwise it is extracted as empty and never reaches the semantic pass.
+    p = _write(tmp_path, ".github/workflows/README.yml", "title: not a workflow\n")
+    assert classify_file(p) == FileType.DOCUMENT
+
+
+def test_nested_workflows_dir_is_not_reclassified(tmp_path):
     # GitHub only recognizes workflow files directly in .github/workflows/,
     # not nested deeper -- so neither does this carve-out.
-    assert classify_file(Path(".github/workflows/nested/ci.yml")) == FileType.DOCUMENT
+    p = _write(tmp_path, ".github/workflows/nested/ci.yml", WORKFLOW)
+    assert classify_file(p) == FileType.DOCUMENT
 
 
-def test_composite_action_yml_is_not_reclassified():
+def test_composite_action_yml_is_not_reclassified(tmp_path):
     # .github/actions/<name>/action.yml (composite/local actions) is a
     # different, unmodelled shape -- explicitly out of this ticket's scope,
     # must not be swept in by a loose ".github/**/*.yml" check.
-    assert classify_file(Path(".github/actions/setup/action.yml")) == FileType.DOCUMENT
+    p = _write(tmp_path, ".github/actions/setup/action.yml", WORKFLOW)
+    assert classify_file(p) == FileType.DOCUMENT
 
 
-def test_other_yaml_still_classified_as_document():
+def test_other_yaml_still_classified_as_document(tmp_path):
     # The whole point of scoping this narrowly: Helm values, k8s manifests,
     # OpenAPI specs, docker-compose.yml must keep their existing,
     # correctly-working semantic-pass classification untouched.
-    assert classify_file(Path("charts/myapp/values.yaml")) == FileType.DOCUMENT
-    assert classify_file(Path("k8s/deployment.yaml")) == FileType.DOCUMENT
-    assert classify_file(Path("openapi.yaml")) == FileType.DOCUMENT
-    assert classify_file(Path("docker-compose.yml")) == FileType.DOCUMENT
+    assert classify_file(_write(tmp_path, "charts/myapp/values.yaml", "replicaCount: 1\n")) == FileType.DOCUMENT
+    assert classify_file(_write(tmp_path, "k8s/deployment.yaml", "apiVersion: v1\nkind: Deployment\n")) == FileType.DOCUMENT
+    assert classify_file(_write(tmp_path, "openapi.yaml", "openapi: 3.0.0\n")) == FileType.DOCUMENT
+    assert classify_file(_write(tmp_path, "docker-compose.yml", COMPOSE)) == FileType.DOCUMENT
 
 
 def test_workflow_extracted_under_code_only_semantics(tmp_path):
@@ -260,3 +280,57 @@ def test_workflow_extracted_under_code_only_semantics(tmp_path):
         assert expected in labels
     assert ("test", "lint") in _rel_pairs(r, "depends_on")
     assert ("lint", "actions/checkout@v4") in _rel_pairs(r, "uses")
+
+
+def test_non_workflow_yaml_gets_no_extractor(tmp_path):
+    # _get_extractor() must gate .yaml/.yml the same way classify_file()
+    # does: a file that isn't workflow-shaped (wrong path, or right path but
+    # wrong content) gets no extractor at all rather than being dispatched
+    # to extract_github_actions and misreported as a failed/empty
+    # extraction (review round 3).
+    from graphify.extract import _get_extractor
+    assert _get_extractor(_write(tmp_path, "docker-compose.yml", COMPOSE)) is None
+    assert _get_extractor(_write(tmp_path, ".github/workflows/README.yml", "title: x\n")) is None
+    assert _get_extractor(_write(tmp_path, ".github/workflows/ci.yml", WORKFLOW)) is extract_github_actions
+
+
+# ── extract_github_actions(): missing vs broken grammar (#2602-style) ───────
+
+def test_github_actions_reports_load_failure_not_missing(tmp_path, monkeypatch):
+    # Same distinction as extractors/sql.py: an installed-but-broken grammar
+    # (e.g. a wheel built for a different Python ABI) raises ImportError at
+    # import time just like an absent one. Must not claim "not installed" --
+    # that sends the user to a no-op `pip install` -- but surface the real
+    # load exception instead.
+    import builtins
+    pytest.importorskip("tree_sitter_yaml")  # find_spec must see it as installed
+
+    _orig_import = builtins.__import__
+
+    def _broken_import(name, *args, **kwargs):
+        if name == "tree_sitter_yaml":
+            raise ImportError("dynamic module does not define module export function")
+        return _orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _broken_import)
+    err = extract_github_actions(_write(tmp_path, ".github/workflows/ci.yml", WORKFLOW)).get("error") or ""
+    assert "failed to load" in err
+    assert "dynamic module does not define module export function" in err
+    assert "pip install" not in err
+
+
+def test_github_actions_reports_grammar_init_failure_as_load_failure(tmp_path, monkeypatch):
+    # A grammar init failure (Language()/Parser() raising, e.g. an ABI
+    # version mismatch surfacing one call later than the import itself) must
+    # get the same "failed to load" marker as an ImportError, not be
+    # conflated with an unrelated file-read error.
+    pytest.importorskip("tree_sitter_yaml")
+    import tree_sitter
+
+    def _broken_language(*args, **kwargs):
+        raise ValueError("Incompatible Language version")
+
+    monkeypatch.setattr(tree_sitter, "Language", _broken_language)
+    err = extract_github_actions(_write(tmp_path, ".github/workflows/ci.yml", WORKFLOW)).get("error") or ""
+    assert "failed to load" in err
+    assert "Incompatible Language version" in err

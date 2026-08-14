@@ -18,9 +18,12 @@ input, not just add a semantic-pass extractor.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from graphify.extractors.base import _file_stem, _make_id
+
+_JOBS_KEY_RE = re.compile(rb"(?m)^jobs\s*:")
 
 
 def is_github_actions_workflow_path(path: Path) -> bool:
@@ -29,15 +32,40 @@ def is_github_actions_workflow_path(path: Path) -> bool:
 
     This is GitHub's own rule for what it treats as a workflow definition,
     valid or not (workflow files must live directly in `.github/workflows/`,
-    not nested deeper) -- so it is a precise, zero-I/O signal usable at
-    classify_file() time, before any content is read. Content is still
-    validated separately inside extract_github_actions() itself (a
-    malformed/non-workflow file at this path returns an empty result rather
-    than being misclassified retroactively).
+    not nested deeper) -- so it is a precise signal usable at classify_file()
+    time. See `looks_like_workflow_shape` for the accompanying content check
+    -- path alone is not enough (a non-workflow file can sit at this path
+    too, e.g. a stray Docker Compose file, #OSAC-4049 review round 3).
     """
     if path.suffix.lower() not in (".yml", ".yaml"):
         return False
     return path.parent.name == "workflows" and path.parent.parent.name == ".github"
+
+
+def looks_like_workflow_shape(path: Path) -> bool:
+    """Cheap, tree-sitter-free content sniff: does the file have a top-level
+    `jobs:` key?
+
+    Used by classify_file() alongside `is_github_actions_workflow_path` so a
+    file that merely *sits* in `.github/workflows/` but isn't actually
+    workflow-shaped (a stray Docker Compose file, a schema doc, ...) falls
+    through to DOCUMENT instead of being routed to CODE, extracted as empty
+    by `extract_github_actions`, and then never reaching the semantic pass
+    at all -- a real content-loss bug caught in OSAC-4049's review (the
+    original design deferred all content validation to the extractor, which
+    only prevents a *misclassified* file from producing garbage nodes, not
+    from being misclassified in the first place). Deliberately a plain regex
+    over a bounded byte prefix rather than a full tree-sitter parse: unlike
+    `extract_github_actions`, classify_file() must keep working without the
+    optional `[yaml]` extra installed, and this only needs to answer "is
+    this even shaped like a workflow", not build real nodes/edges from it.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(65536)
+    except OSError:
+        return False
+    return _JOBS_KEY_RE.search(head) is not None
 
 
 # Step/job keys that carry a reference to another action or reusable workflow
@@ -211,16 +239,34 @@ def extract_github_actions(path: Path) -> dict:
     try:
         import tree_sitter_yaml as tsyaml
         from tree_sitter import Language, Parser
-    except ImportError:
-        return {"nodes": [], "edges": [], "error": "tree_sitter_yaml not installed. Run: pip install tree-sitter-yaml"}
+    except ImportError as e:
+        import importlib.util
+        # An installed-but-broken grammar (e.g. a C extension built for a
+        # different Python ABI, #2602) raises ImportError here too, same as
+        # extractors/sql.py's identical distinction. Reporting that as "not
+        # installed" sends the user to a no-op `pip install`, so check
+        # whether the module actually resolves before deciding which error
+        # to surface.
+        if importlib.util.find_spec("tree_sitter_yaml") is None:
+            return {"nodes": [], "edges": [], "error": "tree_sitter_yaml not installed. Run: pip install tree-sitter-yaml"}
+        return {"nodes": [], "edges": [], "error": f"tree_sitter_yaml is installed but failed to load: {e}"}
+
+    try:
+        language = Language(tsyaml.language())
+        parser = Parser(language)
+    except Exception as e:
+        # Same "installed but broken" case as the ImportError branch above,
+        # just raised one call later (e.g. a tree-sitter ABI version
+        # mismatch surfaces here, not at import time) -- keep the same
+        # marker so extract.py's #1745 dependency warning classifies it
+        # correctly instead of treating it as some other extraction error.
+        return {"nodes": [], "edges": [], "error": f"tree_sitter_yaml is installed but failed to load: {e}"}
 
     try:
         with path.open("rb") as fh:
             source = fh.read(_YAML_MAX_BYTES + 1)
         if len(source) > _YAML_MAX_BYTES:
             return {"nodes": [], "edges": [], "error": "yaml file too large to index"}
-        language = Language(tsyaml.language())
-        parser = Parser(language)
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:

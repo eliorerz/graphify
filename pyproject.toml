@@ -74,7 +74,20 @@ anthropic = ["anthropic"]
 gemini = ["openai", "tiktoken"]
 openai = ["openai", "tiktoken"]
 chinese = ["jieba"]
+# NOTE: OSAC-4049 (unmerged as of this writing) also adds this exact same
+# extra for extract_github_actions() -- when both PRs merge these entries
+# are identical and trivially resolve, unlike the _DISPATCH collision noted
+# in extract.py.
 sql = ["tree-sitter-sql"]
+# extract_yaml() (graphify/extractors/yaml_dispatch.py) models k8s manifest
+# ownership/reference/selector structure when recognized, and a generic
+# structural fallback for every other .yaml/.yml otherwise (OSAC-4050 --
+# deliberately universal coverage, not just recognized schemas). ALL YAML is
+# now routed to FileType.CODE (graphify/detect.py) unconditionally, matching
+# how .json already works -- so without this extra, every .yaml/.yml in the
+# corpus hits the #1745 missing-dependency warning; there is no more
+# semantic-pass fallback for YAML to silently degrade to.
+yaml = ["tree-sitter-yaml"]
 # extract_pascal() uses tree-sitter-pascal for AST-quality extraction (more
 # accurate calls/inherits edges) and falls back to a regex extractor when it is
 # absent (#781), so this stays optional. Unlike tree-sitter-dm below, it ships
@@ -85,7 +98,7 @@ pascal = ["tree-sitter-pascal"]
 # avoids breaking the default `uv tool install graphifyy` for everyone (#1104).
 dm = ["tree-sitter-dm"]
 terraform = ["tree-sitter-hcl"]
-all = ["mcp>=1,<3", "starlette>=1.3.1,<2", "neo4j", "falkordb", "pypdf>=6.12.0", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper; python_version >= '3.11'", "yt-dlp>=2026.6.9", "matplotlib", "numpy>=2.0; python_version >= '3.13'", "openai", "tiktoken", "boto3", "anthropic", "tree-sitter-sql", "jieba", "tree-sitter-dm", "tree-sitter-hcl", "tree-sitter-pascal"]
+all = ["mcp>=1,<3", "starlette>=1.3.1,<2", "neo4j", "falkordb", "pypdf>=6.12.0", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper; python_version >= '3.11'", "yt-dlp>=2026.6.9", "matplotlib", "numpy>=2.0; python_version >= '3.13'", "openai", "tiktoken", "boto3", "anthropic", "tree-sitter-sql", "tree-sitter-yaml", "jieba", "tree-sitter-dm", "tree-sitter-hcl", "tree-sitter-pascal"]
 
 [project.scripts]
 graphify = "graphify.__main__:main"

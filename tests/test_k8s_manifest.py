@@ -1,0 +1,355 @@
+"""Tests for the Kubernetes manifest extractor
+(graphify/extractors/k8s_manifest.py) and the combined YAML dispatcher
+(graphify/extractors/yaml_dispatch.py) that layers it over the generic
+structural fallback (graphify/extractors/yaml_generic.py) -- OSAC-4050.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from graphify.build import build_from_json
+from graphify.detect import FileType, classify_file
+from graphify.extract import extract, extract_k8s_manifest, extract_yaml
+
+
+def _write(tmp_path: Path, name: str, body: str) -> Path:
+    p = tmp_path / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def _labels(r) -> list[str]:
+    return [n["label"] for n in r["nodes"]]
+
+
+def _rel_pairs(r, relation: str) -> set[tuple[str, str]]:
+    lab = {n["id"]: n["label"] for n in r["nodes"]}
+    return {
+        (lab.get(e["source"], e["source"]), lab.get(e["target"], e["target"]))
+        for e in r["edges"]
+        if e["relation"] == relation
+    }
+
+
+@pytest.fixture(autouse=True)
+def _require_grammar():
+    pytest.importorskip("tree_sitter_yaml")
+
+
+# ── ownerReferences (standard k8s) ──────────────────────────────────────────
+
+OWNER_REF_CHILD = """\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker-pod
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: ReplicaSet
+      name: worker-rs
+"""
+
+
+def test_owner_references_become_owns_edges(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "pod.yaml", OWNER_REF_CHILD))
+    assert r.get("error") is None
+    assert ("ReplicaSet/worker-rs", "Pod/worker-pod") in _rel_pairs(r, "owns")
+
+
+def test_owner_reference_resolves_to_real_definition_across_files(tmp_path):
+    parent = _write(tmp_path, "rs.yaml", "apiVersion: apps/v1\nkind: ReplicaSet\nmetadata:\n  name: worker-rs\n")
+    child = _write(tmp_path, "pod.yaml", OWNER_REF_CHILD)
+    r = extract([parent.resolve(), child.resolve()], root=tmp_path)
+    rs_ids = {n["id"] for n in r["nodes"] if n["label"] == "ReplicaSet/worker-rs"}
+    assert len(rs_ids) == 1, f"expected one ReplicaSet node, got {rs_ids}"
+    assert rs_ids.pop() in {e["source"] for e in r["edges"] if e["relation"] == "owns"}
+
+
+# ── custom annotation-based owner-reference + tenant (architecture-patterns.md) ──
+
+ANNOTATED_CHILD = """\
+apiVersion: osac.openshift.io/v1alpha1
+kind: Subnet
+metadata:
+  name: my-subnet
+  annotations:
+    osac.openshift.io/owner-reference: 00000000-0000-0000-0000-000000000000
+    osac.openshift.io/tenant: my-tenant
+"""
+
+
+def test_custom_owner_reference_annotation_becomes_owns_edge(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "subnet.yaml", ANNOTATED_CHILD))
+    owns = _rel_pairs(r, "owns")
+    assert ("00000000-0000-0000-0000-000000000000", "Subnet/my-subnet") in owns
+
+
+def test_tenant_annotation_becomes_scoped_to_edge(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "subnet.yaml", ANNOTATED_CHILD))
+    assert ("Subnet/my-subnet", "my-tenant") in _rel_pairs(r, "scoped_to")
+
+
+# ── ConfigMap / Secret references ───────────────────────────────────────────
+
+WORKLOAD_WITH_REFS = """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: password
+          volumeMounts:
+            - name: cfg
+              mountPath: /etc/cfg
+      volumes:
+        - name: cfg
+          configMap:
+            name: shared-config
+"""
+
+
+def test_configmap_ref_from_envfrom(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "deploy.yaml", WORKLOAD_WITH_REFS))
+    uses = _rel_pairs(r, "uses")
+    assert ("Deployment/api", "ConfigMap/app-config") in uses
+
+
+def test_secret_ref_from_envfrom(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "deploy.yaml", WORKLOAD_WITH_REFS))
+    assert ("Deployment/api", "Secret/app-secrets") in _rel_pairs(r, "uses")
+
+
+def test_secret_key_ref_from_env_valuefrom(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "deploy.yaml", WORKLOAD_WITH_REFS))
+    assert ("Deployment/api", "Secret/db-secret") in _rel_pairs(r, "uses")
+
+
+def test_configmap_ref_from_volume(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "deploy.yaml", WORKLOAD_WITH_REFS))
+    assert ("Deployment/api", "ConfigMap/shared-config") in _rel_pairs(r, "uses")
+
+
+def test_configmap_secret_ref_resolves_across_files(tmp_path):
+    cm = _write(tmp_path, "cm.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config\n")
+    dep = _write(tmp_path, "deploy.yaml", WORKLOAD_WITH_REFS)
+    r = extract([cm.resolve(), dep.resolve()], root=tmp_path)
+    cm_ids = {n["id"] for n in r["nodes"] if n["label"] == "ConfigMap/app-config"}
+    assert len(cm_ids) == 1
+
+
+# ── *Ref / *Refs CRD cross-reference convention ─────────────────────────────
+
+COMPUTE_INSTANCE = """\
+apiVersion: osac.openshift.io/v1alpha1
+kind: ComputeInstance
+metadata:
+  name: computeinstance-sample
+spec:
+  networkAttachments:
+    - subnetRef: my-subnet
+      securityGroupRefs:
+        - web-sg
+        - monitoring-sg
+"""
+
+
+def test_singular_ref_convention(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "ci.yaml", COMPUTE_INSTANCE))
+    refs = _rel_pairs(r, "references")
+    assert ("ComputeInstance/computeinstance-sample", "Subnet/my-subnet") in refs
+
+
+def test_plural_refs_convention(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "ci.yaml", COMPUTE_INSTANCE))
+    refs = _rel_pairs(r, "references")
+    assert ("ComputeInstance/computeinstance-sample", "SecurityGroup/web-sg") in refs
+    assert ("ComputeInstance/computeinstance-sample", "SecurityGroup/monitoring-sg") in refs
+
+
+def test_bare_field_without_ref_suffix_is_not_treated_as_a_reference(tmp_path):
+    # Subnet.spec.virtualNetwork (this repo's own real sample) is a UUID with
+    # no Ref/Refs suffix -- deliberately not modelled (module docstring).
+    body = ("apiVersion: osac.openshift.io/v1alpha1\nkind: Subnet\nmetadata:\n"
+            "  name: subnet-sample\nspec:\n  virtualNetwork: 00000000-0000-0000-0000-000000000000\n")
+    r = extract_k8s_manifest(_write(tmp_path, "subnet.yaml", body))
+    assert _rel_pairs(r, "references") == set()
+
+
+# ── label-selector matching ──────────────────────────────────────────────────
+
+SERVICE = "apiVersion: v1\nkind: Service\nmetadata:\n  name: osac-console-proxy\nspec:\n  selector:\n    app: osac-console-proxy\n"
+DEPLOYMENT = (
+    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: osac-console-proxy\nspec:\n"
+    "  template:\n    metadata:\n      labels:\n        app: osac-console-proxy\n"
+)
+
+
+def test_service_selector_and_deployment_labels_share_a_hub(tmp_path):
+    """Real example from this repo: osac-operator/config/console-proxy/
+    service.yaml's selector matches deployment.yaml's pod template labels
+    exactly (single key=value pair -- the exact case, not the approximate
+    multi-key one)."""
+    svc = _write(tmp_path, "service.yaml", SERVICE)
+    dep = _write(tmp_path, "deployment.yaml", DEPLOYMENT)
+    r = extract([svc.resolve(), dep.resolve()], root=tmp_path)
+
+    hub_ids = {n["id"] for n in r["nodes"] if n["label"] == "app=osac-console-proxy"}
+    assert len(hub_ids) == 1, f"expected one shared label hub, got {hub_ids}"
+    hub_id = hub_ids.pop()
+
+    selects_sources = {e["source"] for e in r["edges"] if e["relation"] == "selects" and e["target"] == hub_id}
+    has_label_sources = {e["source"] for e in r["edges"] if e["relation"] == "has_label" and e["target"] == hub_id}
+    assert len(selects_sources) == 1
+    assert len(has_label_sources) == 1
+
+    G = build_from_json({"nodes": r["nodes"], "edges": r["edges"]})
+    assert G.has_node(hub_id)
+
+
+def test_metadata_labels_also_emit_has_label(tmp_path):
+    body = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: worker\n  labels:\n    tier: backend\n"
+    r = extract_k8s_manifest(_write(tmp_path, "pod.yaml", body))
+    assert ("Pod/worker", "tier=backend") in _rel_pairs(r, "has_label")
+
+
+def test_match_expressions_are_skipped_not_guessed(tmp_path):
+    body = (
+        "apiVersion: apps/v1\nkind: NetworkPolicy\nmetadata:\n  name: np\nspec:\n"
+        "  selector:\n    matchExpressions:\n      - key: tier\n        operator: In\n        values: [backend]\n"
+    )
+    r = extract_k8s_manifest(_write(tmp_path, "np.yaml", body))
+    assert _rel_pairs(r, "selects") == set()
+
+
+# ── shape validation: real vs coincidental key names ────────────────────────
+
+def test_key_presence_alone_is_not_enough(tmp_path):
+    # Has apiVersion/kind/metadata as keys, but kind isn't a real k8s-style
+    # PascalCase type and apiVersion isn't a real k8s apiVersion string.
+    body = "apiVersion: yes\nkind: not-a-real-kind\nmetadata:\n  name: x\n"
+    r = extract_k8s_manifest(_write(tmp_path, "coincidence.yaml", body))
+    assert r["nodes"] == []
+
+
+def test_data_yaml_returns_empty(tmp_path):
+    body = "openapi: 3.0.0\npaths:\n  /users:\n    get:\n      summary: list users\n"
+    r = extract_k8s_manifest(_write(tmp_path, "openapi.yaml", body))
+    assert r["nodes"] == []
+    assert r["edges"] == []
+
+
+def test_docker_compose_is_out_of_scope(tmp_path):
+    body = "services:\n  api:\n    image: api:latest\n"
+    r = extract_k8s_manifest(_write(tmp_path, "docker-compose.yml", body))
+    assert r["nodes"] == []
+
+
+# ── multi-document files ────────────────────────────────────────────────────
+
+def test_multi_document_file_extracts_all_resources(tmp_path):
+    """Real shape from osac-operator/config/manager/manager.yaml: a
+    Namespace and a Deployment bundled in one file via `---`."""
+    body = (
+        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: osac\n"
+        "---\n"
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: osac-controller-manager\n"
+        "  namespace: osac\n  ownerReferences:\n    - apiVersion: v1\n      kind: Namespace\n      name: osac\n"
+    )
+    r = extract_k8s_manifest(_write(tmp_path, "manager.yaml", body))
+    labels = set(_labels(r))
+    assert "Namespace/osac" in labels
+    assert "Deployment/osac-controller-manager" in labels
+    assert ("Namespace/osac", "Deployment/osac-controller-manager") in _rel_pairs(r, "owns")
+
+
+def test_no_dangling_edge_endpoints(tmp_path):
+    r = extract_k8s_manifest(_write(tmp_path, "deploy.yaml", WORKLOAD_WITH_REFS))
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids
+        assert e["target"] in node_ids
+
+
+# ── combined dispatcher: layering + templated-YAML safety ──────────────────
+
+def test_dispatcher_routes_k8s_shaped_yaml_to_rich_extraction(tmp_path):
+    r = extract_yaml(_write(tmp_path, "service.yaml", SERVICE))
+    assert "selects" in {e["relation"] for e in r["edges"]}
+
+
+def test_dispatcher_falls_back_to_generic_structure_for_non_k8s_yaml(tmp_path):
+    body = "replicaCount: 3\nimage:\n  repository: myapp\n"
+    r = extract_yaml(_write(tmp_path, "values.yaml", body))
+    labels = set(_labels(r))
+    assert "replicaCount" in labels
+    assert "image" in labels
+    assert "repository" in labels
+    # No k8s-specific relations should appear for a plain values file.
+    assert not ({"owns", "uses", "selects", "has_label", "references"} & {e["relation"] for e in r["edges"]})
+
+
+def test_dispatcher_skips_templated_yaml_without_crashing(tmp_path, capsys):
+    """Real Go-templated shape from osac-operator/charts/operator/templates/
+    metrics-service.yaml -- confirmed empirically (during this ticket's
+    investigation) to produce a tree-sitter ERROR node, not a best-effort
+    partial parse."""
+    body = (
+        "apiVersion: v1\nkind: Service\nmetadata:\n"
+        '  name: {{ include "osac-operator.fullname" . }}-metrics\n'
+        "spec:\n  selector:\n    {{- include \"osac-operator.selectorLabels\" . | nindent 4 }}\n"
+    )
+    p = _write(tmp_path, "metrics-service.yaml", body)
+    r = extract_yaml(p)
+    assert r == {"nodes": [], "edges": []}
+    captured = capsys.readouterr()
+    assert "metrics-service.yaml" in captured.err
+    assert "did not parse" in captured.err
+
+
+def test_dispatcher_handles_mixed_multi_doc_file(tmp_path):
+    """One k8s-shaped document and one plain document in the same file --
+    each should be routed to the correct layer independently."""
+    body = (
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\ndata:\n  key: value\n"
+        "---\n"
+        "plainKey: plainValue\n"
+    )
+    r = extract_yaml(_write(tmp_path, "mixed.yaml", body))
+    labels = set(_labels(r))
+    assert "ConfigMap/cm" in labels
+    assert "plainKey" in labels
+
+
+# ── classify_file(): universal YAML/JSON coverage ───────────────────────────
+
+def test_all_yaml_classified_as_code():
+    # OSAC-4050: matches .json's existing precedent -- every .yaml/.yml is
+    # CODE unconditionally now, regardless of shape (k8s-shaped or not).
+    assert classify_file(Path("charts/myapp/values.yaml")) == FileType.CODE
+    assert classify_file(Path("k8s/deployment.yaml")) == FileType.CODE
+    assert classify_file(Path("openapi.yaml")) == FileType.CODE
+    assert classify_file(Path("docker-compose.yml")) == FileType.CODE
+    assert classify_file(Path(".github/actions/setup/action.yml")) == FileType.CODE
+
+
+def test_all_json_still_classified_as_code():
+    # Unaffected by this ticket -- .json was already unconditionally CODE.
+    assert classify_file(Path("data.json")) == FileType.CODE
+    assert classify_file(Path("package.json")) == FileType.CODE

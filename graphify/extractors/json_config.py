@@ -202,15 +202,20 @@ def extract_json(path: Path) -> dict:
     doc = root
     if doc.type == "document" and doc.child_count > 0:
         doc = doc.children[0]
-    if doc.type == "object":
-        # Only AST-extract recognized config/manifest JSON. Data JSON (fixtures,
-        # datasets, GeoJSON, API dumps) is skipped so it doesn't explode into
-        # orphan key-nodes (#1224); it's left to the LLM semantic pass.
-        if not _is_config_json(path, doc, source):
-            return {"nodes": [], "edges": [], "skipped": "data json (not a config/manifest)"}
+    if doc.type == "object" and _is_config_json(path, doc, source):
         walk_object(doc, file_nid, None, 0, [0])
-    else:
-        # Top-level array or scalar => data JSON, never a config/manifest.
-        return {"nodes": [], "edges": [], "skipped": "data json (non-object root)"}
+        return {"nodes": nodes, "edges": edges}
 
-    return {"nodes": nodes, "edges": edges}
+    # Data JSON (fixtures, datasets, GeoJSON, API dumps, or any top-level
+    # array/scalar) doesn't get the rich config-specific dependency/extends/
+    # $ref treatment above (#1224 -- that produced hundreds of orphan
+    # key-nodes when applied indiscriminately). Per OSAC-4050's explicit,
+    # confirmed direction change, it no longer disappears from the graph
+    # either: fall back to a genuinely generic structural walk (no domain
+    # semantics), same design as graphify/extractors/yaml_generic.py.
+    from graphify.extractors.json_generic import extract_generic_structure as _generic_json
+    generic_nodes, generic_edges, truncated = _generic_json(doc, source, str_path, file_nid)
+    result: dict = {"nodes": nodes + generic_nodes, "edges": edges + generic_edges}
+    if truncated:
+        result["truncated"] = f"generic structural walk capped at node limit for {path.name}"
+    return result

@@ -54,6 +54,9 @@ from graphify.extractors.sln import extract_sln  # noqa: F401
 from graphify.extractors.sql import extract_sql  # noqa: F401
 from graphify.extractors.terraform import extract_terraform  # noqa: F401
 from graphify.extractors.verilog import extract_verilog  # noqa: F401
+from graphify.extractors.k8s_manifest import extract_k8s_manifest  # noqa: F401
+from graphify.extractors.yaml_generic import extract_generic_structure as extract_yaml_generic  # noqa: F401
+from graphify.extractors.yaml_dispatch import extract_yaml  # noqa: F401
 from graphify.extractors.zig import extract_zig  # noqa: F401
 from graphify.security import sanitize_metadata
 from graphify.paths import disambiguate_ambiguous_candidates
@@ -4843,6 +4846,14 @@ _DISPATCH: dict[str, Any] = {
     ".sh": extract_bash,
     ".bash": extract_bash,
     ".json": extract_json,
+    # NOTE: OSAC-4049 (unmerged as of this writing) also dispatches
+    # .yaml/.yml, to extract_github_actions -- when both PRs merge these two
+    # entries will conflict and need combining into one dispatcher that tries
+    # each shape in turn (GH Actions, then k8s manifest, then the generic
+    # structural fallback below), not simply picking one. Flagged in this
+    # PR's description.
+    ".yaml": extract_yaml,
+    ".yml": extract_yaml,
     ".tf": extract_terraform,
     ".tfvars": extract_terraform,
     ".hcl": extract_terraform,
@@ -4870,6 +4881,8 @@ _DISPATCH: dict[str, Any] = {
 # extract() to tell the user which extra restores the language.
 _EXTRA_FOR_EXTENSION = {
     ".sql": "sql",
+    ".yaml": "yaml",
+    ".yml": "yaml",
     ".tf": "terraform",
     ".tfvars": "terraform",
     ".hcl": "terraform",

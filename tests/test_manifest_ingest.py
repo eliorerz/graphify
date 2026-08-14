@@ -24,8 +24,13 @@ def test_manifests_classify_as_code_not_document(tmp_path):
         p = _write(tmp_path / name, "x")
         assert is_package_manifest_path(p)
         assert classify_file(p) is FileType.CODE, name
-    # a generic yaml stays a document
-    assert classify_file(_write(tmp_path / "config.yaml", "a: 1")) is FileType.DOCUMENT
+    # OSAC-4050: .yaml/.yml is unconditionally CODE now too (matching
+    # .json's existing precedent), so this no longer distinguishes a
+    # manifest from "a generic yaml" the way it used to -- kept as a
+    # regression guard that the manifest carve-out still fires (it's
+    # checked via is_package_manifest_path above, independent of the
+    # extension-based classification a plain config.yaml also gets).
+    assert classify_file(_write(tmp_path / "config.yaml", "a: 1")) is FileType.CODE
 
 
 # ── per-format parsing ───────────────────────────────────────────────────────

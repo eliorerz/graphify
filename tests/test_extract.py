@@ -2840,8 +2840,12 @@ def test_extract_json_no_self_loops():
 # Data JSON must not explode into orphan key-nodes (#1224)
 # ---------------------------------------------------------------------------
 
-def test_extract_json_data_file_skipped(tmp_path):
-    """A data-shaped .json (eval fixture / dataset) must NOT emit per-key nodes."""
+def test_extract_json_data_file_gets_generic_structure(tmp_path):
+    """A data-shaped .json (eval fixture / dataset) does not get the rich
+    config-specific dependency/extends/$ref treatment, but (OSAC-4050,
+    universal-coverage direction) is no longer invisible either -- it falls
+    back to a generic structural walk (one node per key/list item, no
+    domain semantics)."""
     data = tmp_path / "cases.json"
     data.write_text(json.dumps({
         "generation": {"target": "gpt-4", "cases_file": "c.json", "num_cases": 12},
@@ -2849,18 +2853,23 @@ def test_extract_json_data_file_skipped(tmp_path):
         "suite": [{"name": "x"}, {"name": "y"}],
     }))
     result = extract_json(data)
-    assert result["nodes"] == []
-    assert result["edges"] == []
-    assert "skipped" in result
+    labels = {n["label"] for n in result["nodes"]}
+    assert "generation" in labels
+    assert "prompt_inputs_spec" in labels
+    assert "suite" in labels
+    # None of the rich config-only edge kinds (imports/extends/references)
+    # -- those stay exclusive to recognized config/manifest JSON.
+    assert not any(e["relation"] in ("imports", "extends", "references") for e in result["edges"])
 
 
-def test_extract_json_top_level_array_skipped(tmp_path):
-    """A JSON file whose root is an array is data, never a config/manifest."""
+def test_extract_json_top_level_array_gets_generic_structure(tmp_path):
+    """A JSON file whose root is an array is data, never a config/manifest,
+    but still gets generic structural nodes (OSAC-4050)."""
     data = tmp_path / "records.json"
     data.write_text(json.dumps([{"id": 1}, {"id": 2}]))
     result = extract_json(data)
-    assert result["nodes"] == []
-    assert result["edges"] == []
+    labels = {n["label"] for n in result["nodes"]}
+    assert "id" in labels
 
 
 def test_extract_json_config_by_filename_still_extracted(tmp_path):

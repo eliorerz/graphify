@@ -390,7 +390,7 @@ def test_collect_files_skips_hidden():
         assert not any(part.startswith(".") for part in f.parts)
 
 
-def test_collect_files_follows_symlinked_directory(tmp_path):
+def test_collect_files_follows_symlinked_directory(requires_symlinks, tmp_path):
     real_dir = tmp_path / "real_src"
     real_dir.mkdir()
     (real_dir / "lib.py").write_text("x = 1")
@@ -403,7 +403,7 @@ def test_collect_files_follows_symlinked_directory(tmp_path):
     assert [f.name for f in files_yes].count("lib.py") == 2
 
 
-def test_collect_files_skips_out_of_root_symlinked_directory(tmp_path):
+def test_collect_files_skips_out_of_root_symlinked_directory(requires_symlinks, tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     outside = tmp_path / "outside"
@@ -416,7 +416,7 @@ def test_collect_files_skips_out_of_root_symlinked_directory(tmp_path):
     assert not any("linked_secret" in str(f) for f in files)
 
 
-def test_collect_files_skips_out_of_root_symlinked_file_by_default(tmp_path):
+def test_collect_files_skips_out_of_root_symlinked_file_by_default(requires_symlinks, tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     outside = tmp_path / "outside"
@@ -429,7 +429,7 @@ def test_collect_files_skips_out_of_root_symlinked_file_by_default(tmp_path):
     assert not any(f.name == "secret_link.py" for f in files)
 
 
-def test_collect_files_handles_circular_symlinks(tmp_path):
+def test_collect_files_handles_circular_symlinks(requires_symlinks, tmp_path):
     sub = tmp_path / "pkg"
     sub.mkdir()
     (sub / "mod.py").write_text("x = 1")
@@ -3218,6 +3218,61 @@ def test_extract_no_missing_dep_warning_when_sql_installed(tmp_path, capsys):
     extract([s], cache_root=tmp_path)
     err = capsys.readouterr().err
     assert "#1745" not in err
+
+
+def test_extract_sql_reports_load_failure_not_missing(tmp_path, monkeypatch):
+    # #2602: an installed-but-broken grammar (e.g. a wheel built for a different
+    # Python ABI) raises ImportError at import time just like an absent one. The
+    # extractor must NOT claim "not installed" — that sends the user to a no-op
+    # `pip install` — but surface the real load exception instead.
+    import builtins
+    from graphify.extractors.sql import extract_sql
+    pytest.importorskip("tree_sitter_sql")  # find_spec must see it as installed
+
+    _orig_import = builtins.__import__
+
+    def _broken_import(name, *args, **kwargs):
+        if name == "tree_sitter_sql":
+            raise ImportError("dynamic module does not define module export function")
+        return _orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _broken_import)
+    err = extract_sql(tmp_path / "schema.sql", "SELECT 1;").get("error") or ""
+    assert "failed to load" in err
+    assert "dynamic module does not define module export function" in err
+    assert "pip install" not in err
+
+
+def test_extract_warns_sql_grammar_failed_to_load(tmp_path, capsys, monkeypatch):
+    # #2602: the aggregated #1745 warning must surface a present-but-broken
+    # grammar with the real cause and WITHOUT the misleading "install the extra"
+    # hint, so the files are neither silently dropped nor sent to a no-op fix.
+    import builtins
+    pytest.importorskip("tree_sitter_sql")
+
+    _orig_import = builtins.__import__
+
+    def _broken_import(name, *args, **kwargs):
+        if name == "tree_sitter_sql":
+            raise ImportError("dynamic module does not define module export function")
+        return _orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _broken_import)
+    s1 = tmp_path / "schema.sql"; s1.write_text("CREATE TABLE users (id INT);\n")
+    s2 = tmp_path / "views.sql"; s2.write_text("CREATE VIEW v AS SELECT * FROM users;\n")
+
+    result = extract([s1, s2], cache_root=tmp_path)
+    err = capsys.readouterr().err
+
+    assert "2 .sql file(s)" in err
+    assert "failed to load" in err
+    assert "#1745" in err
+    # the no-op fix must NOT be suggested for a present-but-broken grammar
+    assert "graphifyy[sql]" not in err
+    assert "pip install" not in err
+    # #2543: still surfaced as failed so the incremental manifest retries them
+    failed = {Path(p).name for p in result.get("failed_sources", [])}
+    assert failed == {"schema.sql", "views.sql"}
 
 
 def test_extract_progress_final_line_uses_consistent_denominator(tmp_path, capsys):

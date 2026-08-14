@@ -68,6 +68,15 @@ def extract_generic_structure(doc_value, str_path: str, file_nid: str, doc_index
     edges: list[dict] = []
     seen_ids: set[str] = set()
     truncated = False
+    # Counts every structural POSITION visited, independent of how many
+    # distinct node dicts that produced. len(nodes) alone undercounts when
+    # two different positions normalize to the same id (confirmed real:
+    # make_id(path, "a.b", "c") == make_id(path, "a", "b.c") -- a mapping
+    # key containing "." collapses with a differently-shaped path), which
+    # let the walk visit unboundedly more positions than the cap intends
+    # while len(nodes) stayed under it -- exactly defeating the point of a
+    # safety valve for a pathological, deeply-nested file.
+    visited = 0
 
     def _mint(parts: tuple[str, ...], label: str, line: int) -> str:
         nid = _make_id(str_path, *parts)
@@ -83,15 +92,16 @@ def extract_generic_structure(doc_value, str_path: str, file_nid: str, doc_index
                       "source_location": f"L{line}", "weight": 1.0})
 
     def _walk(node, parent_nid: str, parts: tuple[str, ...]) -> None:
-        nonlocal truncated
+        nonlocal truncated, visited
         if truncated or node is None:
             return
         mapping = _mapping(node)
         if mapping is not None:
             for key, value, line in _pairs(mapping):
-                if len(nodes) >= MAX_NODES_PER_DOCUMENT:
+                if visited >= MAX_NODES_PER_DOCUMENT:
                     truncated = True
                     return
+                visited += 1
                 child_parts = parts + (key,)
                 child_nid = _mint(child_parts, key, line)
                 _add_contains(parent_nid, child_nid, line)
@@ -100,9 +110,10 @@ def extract_generic_structure(doc_value, str_path: str, file_nid: str, doc_index
         seq_items = list(_sequence_items(node))
         if seq_items:
             for i, item in enumerate(seq_items):
-                if len(nodes) >= MAX_NODES_PER_DOCUMENT:
+                if visited >= MAX_NODES_PER_DOCUMENT:
                     truncated = True
                     return
+                visited += 1
                 item_value = _item_value(item)
                 text = _scalar_text(item_value)
                 label = text if text else f"[{i}]"
@@ -116,5 +127,21 @@ def extract_generic_structure(doc_value, str_path: str, file_nid: str, doc_index
         # caller already minted for this position represents it.
 
     doc_parts = (f"doc{doc_index}",)
-    _walk(doc_value, file_nid, doc_parts)
+    mapping_root = _mapping(doc_value)
+    seq_root = list(_sequence_items(doc_value)) if mapping_root is None and doc_value is not None else []
+    if doc_value is not None and mapping_root is None and not seq_root:
+        # Degenerate but real case: the WHOLE document is a bare scalar
+        # (e.g. a file containing just `true` or `"hello"`, no mapping or
+        # sequence at all). Without this, such a file -- and even its own
+        # file node, since the caller only creates one when this function
+        # returns at least one node -- would be completely invisible,
+        # directly contradicting the "nothing invisible" goal universal
+        # coverage exists for.
+        text = _scalar_text(doc_value)
+        if text:
+            line = doc_value.start_point[0] + 1
+            root_nid = _mint(doc_parts, text, line)
+            _add_contains(file_nid, root_nid, line)
+    else:
+        _walk(doc_value, file_nid, doc_parts)
     return nodes, edges, truncated

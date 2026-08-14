@@ -140,14 +140,44 @@ def all_documents(root):
         yield doc
 
 
+# Go/Helm template marker. `has_error` alone is not a reliable signal for
+# real Go-template contamination -- confirmed empirically (OSAC-4050 review):
+# a bare inline template value like `replicas: {{ .Values.x }}` parses with
+# `has_error=False` on the specific document node (the template markers look
+# like valid, if bogus, nested flow-mapping syntax to the YAML grammar, not
+# a parse error), while a concatenated pattern like
+# `image: {{ .Values.x }}:{{ .Values.y }}` sets `has_error=True` on the
+# STREAM root but not on the specific document node -- has_error alone
+# misses real cases in both directions. Any document whose raw text
+# contains this marker is treated as unparseable-for-our-purposes
+# regardless of what has_error reports.
+_TEMPLATE_MARKER = b"{{"
+
+
+def is_unparseable(doc) -> bool:
+    """True if *doc* should not be trusted as real YAML content -- either
+    tree-sitter itself flagged a parse error, or its raw text contains a
+    Go/Helm template marker that has_error alone does not reliably catch
+    (see comment above). Shared by graphify.extractors.k8s_manifest (both
+    the extract_k8s_resources/yaml_dispatch path and the standalone
+    extract_k8s_manifest entry point -- the latter previously lacked this
+    check entirely, a real bypass of the safety net for anyone calling it
+    directly) and graphify.extractors.yaml_dispatch.
+    """
+    return doc.has_error or _TEMPLATE_MARKER in doc.text
+
+
 def all_top_level_mappings(root):
-    """Yield the top-level MAPPING of every document in the file (documents
-    that aren't mapping-shaped, or are malformed, are silently skipped --
-    for callers that only care about mapping-shaped resources, e.g. a k8s
-    manifest). See ``all_documents`` for the version that yields every
-    document regardless of shape.
+    """Yield the top-level MAPPING of every document in the file that
+    parses cleanly (see ``is_unparseable``) and is mapping-shaped --
+    documents that aren't mapping-shaped, or are malformed/templated, are
+    silently skipped. For callers that only care about mapping-shaped
+    resources, e.g. a k8s manifest. See ``all_documents`` for the version
+    that yields every document regardless of shape or parseability.
     """
     for doc in all_documents(root):
+        if is_unparseable(doc):
+            continue
         m = mapping(doc)
         if m is not None:
             yield m

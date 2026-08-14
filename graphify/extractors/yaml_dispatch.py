@@ -23,42 +23,24 @@ graphify/extractors/_yaml_cst.py's ``all_documents`` docstring):
    recognized schema should get SOME representation in the graph, rather
    than staying invisible the way pre-OSAC-4050 graphify left ALL YAML.
 
-A document is treated as unparseable-for-our-purposes if EITHER
-`node.has_error` is set OR its raw text contains a `{{` marker. Both
-checks are necessary -- confirmed empirically (another reviewer-caught
-gap) that neither alone is reliable for real Helm template syntax:
-`replicas: {{ .Values.replicaCount }}` (the single most common Helm
-templating idiom) parses with `has_error=False` on the specific document
-node this dispatcher checks even though it's obviously not real YAML content
-(`{{` opens what tree-sitter-yaml treats as valid, if bogus, nested flow-
-mapping syntax) -- silently extracted as "clean" without the `{{` check.
-Conversely, `image: {{ .Values.x }}:{{ .Values.y }}` (concatenated
-template blocks) sets `has_error=True` on the STREAM root but NOT on the
-specific per-document node checked -- silently produces zero output
-without the `has_error` check, since the per-document check alone missed
-an error that exists elsewhere in the same parse tree.
+"Unparseable-for-our-purposes" is decided by
+`graphify.extractors._yaml_cst.is_unparseable` -- shared with
+`k8s_manifest.all_top_level_mappings` (used by the standalone
+`extract_k8s_manifest` entry point) so both paths apply the identical
+gate; see that function's docstring for why `has_error` alone is not
+reliable in either direction for real Helm template syntax.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-from graphify.extractors._yaml_cst import all_documents, mapping as _mapping
+from graphify.extractors._yaml_cst import all_documents, is_unparseable, mapping as _mapping
 from graphify.extractors.base import _make_id
 from graphify.extractors.k8s_manifest import extract_k8s_resources, is_k8s_manifest_shape
 from graphify.extractors.yaml_generic import extract_generic_structure
 
 _YAML_MAX_BYTES = 1_048_576  # 1 MiB -- matches every other extractor's cap in this fork
-
-# Go/Helm template marker. See module docstring: has_error alone (checked
-# per-document) misses real cases in both directions, so any document whose
-# raw text contains this is treated as unparseable-for-our-purposes
-# regardless of what has_error says.
-_TEMPLATE_MARKER = b"{{"
-
-
-def _is_unparseable(doc) -> bool:
-    return doc.has_error or _TEMPLATE_MARKER in doc.text
 
 
 def extract_yaml(path: Path) -> dict:
@@ -106,7 +88,7 @@ def extract_yaml(path: Path) -> dict:
     k8s_shaped_tops: list = []
     generic_docs: list[tuple[int, object]] = []
     for doc_index, doc in enumerate(all_documents(root)):
-        if _is_unparseable(doc):
+        if is_unparseable(doc):
             skipped_docs += 1
             continue
         m = _mapping(doc)

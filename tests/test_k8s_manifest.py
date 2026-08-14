@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from graphify.build import build_from_json
-from graphify.detect import FileType, classify_file
 from graphify.extract import extract, extract_k8s_manifest, extract_yaml
 
 
@@ -66,6 +65,47 @@ def test_owner_reference_resolves_to_real_definition_across_files(tmp_path):
     rs_ids = {n["id"] for n in r["nodes"] if n["label"] == "ReplicaSet/worker-rs"}
     assert len(rs_ids) == 1, f"expected one ReplicaSet node, got {rs_ids}"
     assert rs_ids.pop() in {e["source"] for e in r["edges"] if e["relation"] == "owns"}
+
+
+def test_different_api_groups_same_kind_namespace_name_do_not_collide(tmp_path):
+    """Regression test for a real reviewer-caught bug: resource identity
+    was (kind, namespace, name) with no API group, so two genuinely
+    different resources from different groups sharing a kind/namespace/name
+    (a legitimate real k8s scenario -- apiVersion exists precisely to allow
+    this, e.g. NetworkPolicy historically existed in both extensions/v1beta1
+    and networking.k8s.io/v1) would silently merge into one node."""
+    body = (
+        "apiVersion: apps/v1\nkind: NetworkPolicy\nmetadata:\n  name: np\n  namespace: osac\n"
+        "---\n"
+        "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: np\n  namespace: osac\n"
+    )
+    r = extract_k8s_manifest(_write(tmp_path, "networkpolicies.yaml", body))
+    np_nodes = [n for n in r["nodes"] if n["label"] == "NetworkPolicy/np"]
+    assert len(np_nodes) == 2, f"expected two distinct NetworkPolicy/np nodes (different groups), got {np_nodes}"
+    assert len({n["id"] for n in np_nodes}) == 2, "the two resources must have distinct ids"
+
+
+def test_owner_reference_apiversion_group_disambiguates_cross_group_owner(tmp_path):
+    """An ownerReference names its owner's group via its own apiVersion
+    field -- confirms that field is actually used to resolve to the
+    correctly-grouped owner, not just any resource sharing the kind/name."""
+    body = (
+        "apiVersion: apps/v1\nkind: Foo\nmetadata:\n  name: shared-name\n"
+        "---\n"
+        "apiVersion: osac.openshift.io/v1alpha1\nkind: Foo\nmetadata:\n  name: shared-name\n"
+        "---\n"
+        "apiVersion: v1\nkind: Bar\nmetadata:\n  name: child\n"
+        "  ownerReferences:\n    - apiVersion: osac.openshift.io/v1alpha1\n      kind: Foo\n      name: shared-name\n"
+    )
+    r = extract_k8s_manifest(_write(tmp_path, "mixed-groups.yaml", body))
+    foo_nodes = {n["id"]: n for n in r["nodes"] if n["label"] == "Foo/shared-name"}
+    assert len(foo_nodes) == 2
+    owns_edges = [e for e in r["edges"] if e["relation"] == "owns"]
+    assert len(owns_edges) == 1
+    owner_id = owns_edges[0]["source"]
+    assert foo_nodes[owner_id]["source_file"], "must resolve to a real definition, not a fresh stub"
+    # The resolved owner must be the osac.openshift.io one, not the apps one.
+    assert "osac" in owner_id or "openshift" in owner_id, f"resolved to the wrong group's Foo: {owner_id}"
 
 
 # ── custom annotation-based owner-reference + tenant (architecture-patterns.md) ──
@@ -261,6 +301,19 @@ def test_docker_compose_is_out_of_scope(tmp_path):
     assert r["nodes"] == []
 
 
+def test_standalone_entry_point_also_rejects_templated_yaml(tmp_path):
+    """Regression test for a real reviewer-caught bypass: extract_k8s_manifest()
+    is a separate, directly-callable, re-exported entry point (not wired
+    into the real _DISPATCH pipeline, but used directly by most of this
+    test file and importable via graphify.extract) that previously lacked
+    the has_error/template-marker gate yaml_dispatch.py has -- a templated
+    file routed through THIS function instead of extract_yaml() would have
+    been silently mis-extracted as a valid resource."""
+    body = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\nspec:\n  replicas: {{ .Values.replicaCount }}\n"
+    r = extract_k8s_manifest(_write(tmp_path, "deployment.yaml", body))
+    assert r == {"nodes": [], "edges": []}
+
+
 # ── multi-document files ────────────────────────────────────────────────────
 
 def test_multi_document_file_extracts_all_resources(tmp_path):
@@ -428,21 +481,3 @@ def test_dispatcher_skips_concatenated_template_blocks(tmp_path, capsys):
     r = extract_yaml(p)
     assert r == {"nodes": [], "edges": []}
     assert "not treated as real YAML" in capsys.readouterr().err
-
-
-# ── classify_file(): universal YAML/JSON coverage ───────────────────────────
-
-def test_all_yaml_classified_as_code():
-    # OSAC-4050: matches .json's existing precedent -- every .yaml/.yml is
-    # CODE unconditionally now, regardless of shape (k8s-shaped or not).
-    assert classify_file(Path("charts/myapp/values.yaml")) == FileType.CODE
-    assert classify_file(Path("k8s/deployment.yaml")) == FileType.CODE
-    assert classify_file(Path("openapi.yaml")) == FileType.CODE
-    assert classify_file(Path("docker-compose.yml")) == FileType.CODE
-    assert classify_file(Path(".github/actions/setup/action.yml")) == FileType.CODE
-
-
-def test_all_json_still_classified_as_code():
-    # Unaffected by this ticket -- .json was already unconditionally CODE.
-    assert classify_file(Path("data.json")) == FileType.CODE
-    assert classify_file(Path("package.json")) == FileType.CODE

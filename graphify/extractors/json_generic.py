@@ -64,6 +64,11 @@ def extract_generic_structure(root_value, source: bytes, str_path: str, file_nid
     edges: list[dict] = []
     seen_ids: set[str] = set()
     truncated = False
+    # Counts every structural POSITION visited, independent of how many
+    # distinct node dicts that produced -- see yaml_generic.py's identical
+    # `visited` counter for why len(nodes) alone (deduplicated via
+    # seen_ids) can undercount and let the walk run past the intended cap.
+    visited = 0
 
     def _mint(parts: tuple[str, ...], label: str, line: int) -> str:
         nid = _make_id(str_path, *parts)
@@ -79,19 +84,20 @@ def extract_generic_structure(root_value, source: bytes, str_path: str, file_nid
                       "source_location": f"L{line}", "weight": 1.0})
 
     def _walk(node, parent_nid: str, parts: tuple[str, ...]) -> None:
-        nonlocal truncated
+        nonlocal truncated, visited
         if truncated or node is None:
             return
         if node.type == "object":
             for child in node.children:
                 if child.type != "pair":
                     continue
-                if len(nodes) >= MAX_NODES_PER_DOCUMENT:
+                if visited >= MAX_NODES_PER_DOCUMENT:
                     truncated = True
                     return
                 key = _key_text(child, source)
                 if not key:
                     continue
+                visited += 1
                 value = child.child_by_field_name("value")
                 line = child.start_point[0] + 1
                 child_parts = parts + (key,)
@@ -102,9 +108,10 @@ def extract_generic_structure(root_value, source: bytes, str_path: str, file_nid
         if node.type == "array":
             items = [c for c in node.children if c.is_named]
             for i, item in enumerate(items):
-                if len(nodes) >= MAX_NODES_PER_DOCUMENT:
+                if visited >= MAX_NODES_PER_DOCUMENT:
                     truncated = True
                     return
+                visited += 1
                 text = _scalar_text(item, source) if item.type in ("string", "number", "true", "false", "null") else ""
                 label = text if text else f"[{i}]"
                 line = item.start_point[0] + 1
@@ -115,5 +122,19 @@ def extract_generic_structure(root_value, source: bytes, str_path: str, file_nid
             return
         # Scalar leaf: nothing further to mint.
 
-    _walk(root_value, file_nid, ("doc0",))
+    doc_parts = ("doc0",)
+    if root_value is not None and root_value.type not in ("object", "array"):
+        # Degenerate but real case (same as yaml_generic.py's identical
+        # fix): the whole document is a bare scalar (e.g. a JSON file
+        # containing just `true` or `"hello"`). Without this, such a file
+        # would be completely invisible -- even its own file node, since
+        # the caller only creates one when this function returns at least
+        # one node.
+        text = _scalar_text(root_value, source) if root_value.type in ("string", "number", "true", "false", "null") else ""
+        if text:
+            line = root_value.start_point[0] + 1
+            root_nid = _mint(doc_parts, text, line)
+            _add_contains(file_nid, root_nid, line)
+    else:
+        _walk(root_value, file_nid, doc_parts)
     return nodes, edges, truncated

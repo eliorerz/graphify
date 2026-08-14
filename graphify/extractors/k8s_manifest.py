@@ -160,12 +160,34 @@ _SECRET_REF_KEYS = frozenset({"secretKeyRef", "secretRef", "secret"})
 _REF_NAME_FIELDS = ("name", "secretName")
 
 
-def _resource_id(kind: str, namespace: str, name: str) -> str:
-    # namespace is folded in when present; make_id already drops empty
-    # parts, so an unnamespaced resource just falls back to (kind, name) --
-    # a documented simplification (this repo's own samples rarely set
-    # namespace explicitly), not a false-collision risk in the common case.
-    return _make_id(kind, namespace, name)
+def _api_group(api_version: str) -> str:
+    """Extract the API group from an apiVersion string: "group/version" ->
+    group; a bare "version" (the core group -- e.g. Pod/Service/ConfigMap/
+    Namespace's apiVersion is "v1" with no group at all) -> "".
+
+    Deliberately excludes the VERSION from resource identity: the same
+    group+kind+namespace+name accessed via a different version of that
+    group (e.g. a CRD moving from v1alpha1 to v1beta1) is the same logical
+    resource -- that's exactly what conversion webhooks exist to preserve
+    -- so including version would incorrectly split one real resource into
+    per-version duplicates. GROUP is what distinguishes genuinely different
+    resources that happen to share a kind name (the actual bug this
+    function fixes, e.g. two different API groups both defining a
+    "NetworkPolicy" or a "Subnet").
+    """
+    return api_version.split("/", 1)[0] if "/" in api_version else ""
+
+
+def _resource_id(group: str, kind: str, namespace: str, name: str) -> str:
+    # group/namespace are folded in when present; make_id already drops
+    # empty parts, so a core-group/unnamespaced resource just falls back to
+    # (kind, name) -- a documented simplification (this repo's own samples
+    # rarely set namespace explicitly), not a false-collision risk in the
+    # common case. group specifically fixes a real bug: without it, two
+    # different API groups defining the same kind/namespace/name (a
+    # legitimate, if uncommon, real k8s scenario -- apiVersion exists
+    # precisely to let this happen) would silently collide into one node.
+    return _make_id(group, kind, namespace, name)
 
 
 # Well-known built-in cluster-scoped kinds -- these never carry a namespace
@@ -189,7 +211,7 @@ _CLUSTER_SCOPED_KINDS = frozenset({
 })
 
 
-def _resolve_owner(ref_kind: str, ref_name: str, child_namespace: str,
+def _resolve_owner(ref_group: str, ref_kind: str, ref_name: str, child_namespace: str,
                     local_nids: dict, ref_stub) -> str:
     """Resolve an ownerReference to the real local definition if one
     exists in this batch, trying both the child's own namespace and
@@ -198,18 +220,27 @@ def _resolve_owner(ref_kind: str, ref_name: str, child_namespace: str,
     in the same namespace (the only legal case for two namespaced
     resources), but a cluster-scoped owner (Namespace, ClusterRole, a CRD
     declared cluster-scoped, ...) never has one at all.
+
+    ref_group (from the ownerReference's own apiVersion field, which,
+    unlike a *Ref/*Refs convention reference, IS always present) keys the
+    lookup precisely -- two different API groups defining the same kind
+    must not collide.
     """
     candidate_namespaces = ([""] if ref_kind in _CLUSTER_SCOPED_KINDS
                              else [child_namespace, ""])
     for ns in candidate_namespaces:
-        nid = local_nids.get((ref_kind, ns, ref_name))
+        nid = local_nids.get((ref_group, ref_kind, ns, ref_name))
         if nid is not None:
             return nid
     guess_ns = "" if ref_kind in _CLUSTER_SCOPED_KINDS else child_namespace
-    return ref_stub(_resource_id(ref_kind, guess_ns, ref_name), f"{ref_kind}/{ref_name}")
+    return ref_stub(_resource_id(ref_group, ref_kind, guess_ns, ref_name), f"{ref_kind}/{ref_name}")
 
 
 def _walk_configmap_secret_refs(node, owner_nid, namespace, add_edge, ref_stub):
+    # ConfigMap/Secret are always built-in core-API-group ("v1", group "")
+    # kinds -- no apiVersion is available at the reference site to derive a
+    # group from, but there's also no ambiguity to resolve: unlike a CRD
+    # kind, "ConfigMap"/"Secret" only ever exist in the core group.
     mapping = _mapping(node)
     if mapping is not None:
         for key, value, line in _pairs(mapping):
@@ -225,7 +256,7 @@ def _walk_configmap_secret_refs(node, owner_nid, namespace, add_edge, ref_stub):
                             if ref_name:
                                 break
                     if ref_name:
-                        tgt = ref_stub(_resource_id(kind, namespace, ref_name), f"{kind}/{ref_name}")
+                        tgt = ref_stub(_resource_id("", kind, namespace, ref_name), f"{kind}/{ref_name}")
                         add_edge(owner_nid, tgt, "uses", line)
                 continue
             _walk_configmap_secret_refs(value, owner_nid, namespace, add_edge, ref_stub)
@@ -239,7 +270,14 @@ def _infer_ref_kind(field_key: str, suffix: str) -> str:
     return base[0].upper() + base[1:] if base else ""
 
 
-def _walk_ref_convention(node, owner_nid, namespace, add_edge, ref_stub):
+def _walk_ref_convention(node, owner_nid, owner_group, namespace, add_edge, ref_stub):
+    # A *Ref/*Refs field's raw string value carries no apiVersion of its
+    # own (unlike ownerReferences, which is a structured object that always
+    # includes one) -- there's an inherent ambiguity here that can't be
+    # perfectly resolved. Default to the REFERENCING resource's own group:
+    # in practice, cross-references via this convention are between CRDs of
+    # the same group (e.g. this repo's own ComputeInstance -> Subnet, both
+    # osac.openshift.io) far more often than across groups.
     mapping = _mapping(node)
     if mapping is not None:
         for key, value, line in _pairs(mapping):
@@ -248,19 +286,19 @@ def _walk_ref_convention(node, owner_nid, namespace, add_edge, ref_stub):
             if key.endswith("Refs") and len(key) > len("Refs"):
                 kind = _infer_ref_kind(key, "Refs")
                 for item_text, item_line in _string_items(value):
-                    tgt = ref_stub(_resource_id(kind, namespace, item_text), f"{kind}/{item_text}")
+                    tgt = ref_stub(_resource_id(owner_group, kind, namespace, item_text), f"{kind}/{item_text}")
                     add_edge(owner_nid, tgt, "references", item_line)
             elif key.endswith("Ref") and len(key) > len("Ref"):
                 kind = _infer_ref_kind(key, "Ref")
                 ref_text = _scalar_text(value)
                 if ref_text:
-                    tgt = ref_stub(_resource_id(kind, namespace, ref_text), f"{kind}/{ref_text}")
+                    tgt = ref_stub(_resource_id(owner_group, kind, namespace, ref_text), f"{kind}/{ref_text}")
                     add_edge(owner_nid, tgt, "references", line)
             else:
-                _walk_ref_convention(value, owner_nid, namespace, add_edge, ref_stub)
+                _walk_ref_convention(value, owner_nid, owner_group, namespace, add_edge, ref_stub)
         return
     for item in _sequence_items(node):
-        _walk_ref_convention(_item_value(item), owner_nid, namespace, add_edge, ref_stub)
+        _walk_ref_convention(_item_value(item), owner_nid, owner_group, namespace, add_edge, ref_stub)
 
 
 def _emit_label_hub_edges(labels_node, owner_nid, relation, add_edge, ref_stub):
@@ -323,8 +361,11 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
     just the matching subset while owning the file node itself centrally --
     see graphify/extractors/yaml_dispatch.py.
 
-    Nodes: one per resource (keyed globally by (kind, namespace, name), not
-    file-scoped -- unlike a GitHub Actions job, the same resource can
+    Nodes: one per resource (keyed globally by (group, kind, namespace,
+    name) -- group is the apiVersion's group, e.g. "apps" for "apps/v1" or
+    "" for the core "v1" group, so two different API groups defining the
+    same kind/namespace/name never collide), not file-scoped -- unlike a
+    GitHub Actions job, the same resource can
     legitimately be defined in one file and referenced from many others).
     Sourceless stub nodes (type=module, same hub-collapsing exemption
     GitHub Actions' shared-action stubs use, #1327) stand in for anything
@@ -343,7 +384,7 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
     edges: list[dict] = []
     seen_ids: set[str] = {file_nid}
     seen_edges: set[tuple[str, str, str]] = set()
-    local_nids: dict[tuple[str, str, str], str] = {}
+    local_nids: dict[tuple[str, str, str, str], str] = {}
 
     def _ref_stub(nid: str, label: str) -> str:
         if nid not in seen_ids:
@@ -370,6 +411,7 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
     parsed = []
     for top in resource_tops:
         pairs = {key: (value, line) for key, value, line in _pairs(top)}
+        group = _api_group(_scalar_text(pairs["apiVersion"][0]))
         kind = _scalar_text(pairs["kind"][0])
         metadata = _mapping(pairs["metadata"][0])
         meta_pairs = {key: (value, line) for key, value, line in _pairs(metadata)} if metadata is not None else {}
@@ -379,7 +421,7 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
         namespace = _scalar_text(meta_pairs["namespace"][0]) if "namespace" in meta_pairs else ""
         spec_entry = pairs.get("spec")
         parsed.append({
-            "kind": kind, "name": name, "namespace": namespace,
+            "group": group, "kind": kind, "name": name, "namespace": namespace,
             "meta_pairs": meta_pairs,
             "spec": spec_entry[0] if spec_entry else None,
             "line": pairs["kind"][1],
@@ -389,7 +431,7 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
         return nodes, edges
 
     for r in parsed:
-        nid = _resource_id(r["kind"], r["namespace"], r["name"])
+        nid = _resource_id(r["group"], r["kind"], r["namespace"], r["name"])
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": f"{r['kind']}/{r['name']}", "file_type": "code",
@@ -397,7 +439,7 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
             edges.append({"source": file_nid, "target": nid, "relation": "contains",
                           "confidence": "EXTRACTED", "source_file": str_path,
                           "source_location": f"L{r['line']}", "weight": 1.0})
-        local_nids[(r["kind"], r["namespace"], r["name"])] = nid
+        local_nids[(r["group"], r["kind"], r["namespace"], r["name"])] = nid
         r["nid"] = nid
 
     for r in parsed:
@@ -413,11 +455,12 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
                 if ref_mapping is None:
                     continue
                 ref_pairs = {k: v for k, v, _ln in _pairs(ref_mapping)}
+                ref_group = _api_group(_scalar_text(ref_pairs.get("apiVersion")))
                 ref_kind = _scalar_text(ref_pairs.get("kind"))
                 ref_name = _scalar_text(ref_pairs.get("name"))
                 if not ref_kind or not ref_name:
                     continue
-                parent_nid = _resolve_owner(ref_kind, ref_name, namespace, local_nids, _ref_stub)
+                parent_nid = _resolve_owner(ref_group, ref_kind, ref_name, namespace, local_nids, _ref_stub)
                 _add_edge(parent_nid, owner_nid, "owns", r["line"])
 
         # -- custom annotation-based owner-reference + tenant scoping --
@@ -438,7 +481,7 @@ def extract_k8s_resources(resource_tops: list, str_path: str, file_nid: str) -> 
 
         if r["spec"] is not None:
             _walk_configmap_secret_refs(r["spec"], owner_nid, namespace, _add_edge, _ref_stub)
-            _walk_ref_convention(r["spec"], owner_nid, namespace, _add_edge, _ref_stub)
+            _walk_ref_convention(r["spec"], owner_nid, r["group"], namespace, _add_edge, _ref_stub)
 
         spec_pairs = {}
         if r["spec"] is not None:

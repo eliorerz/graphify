@@ -508,6 +508,21 @@ def classify_file(path: Path) -> FileType | None:
     from graphify.manifest_ingest import is_package_manifest_path
     if is_package_manifest_path(path):
         return FileType.CODE
+    # GitHub Actions workflow YAML (.github/workflows/*.yml|.yaml) has real
+    # structure (jobs, needs, uses) an AST pass can extract deterministically
+    # -- same rationale as the manifest carve-out above, and same mechanism
+    # (route to CODE by path before the generic DOC_EXTENSIONS bucket claims
+    # the .yml/.yaml extension). Path-only check, no file read: content is
+    # validated inside extract_github_actions() itself, which returns an
+    # empty result for anything at this path that isn't actually workflow-
+    # shaped rather than this function guessing from a peek (OSAC-4049).
+    # Every OTHER .yaml/.yml (Helm values, k8s manifests, OpenAPI specs)
+    # deliberately keeps falling through to DOCUMENT below -- reclassifying
+    # YAML generically would regress their existing, correct semantic-pass
+    # handling.
+    from graphify.extractors.github_actions import is_github_actions_workflow_path
+    if is_github_actions_workflow_path(path):
+        return FileType.CODE
     # Compound extensions must be checked before simple suffix lookup
     if path.name.lower().endswith(".blade.php"):
         return FileType.CODE
